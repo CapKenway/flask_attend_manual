@@ -160,6 +160,13 @@ def delete_record(day: str):
     db.commit()
 
 
+def get_weekend_days() -> list[int]:
+    val = get_setting("weekend_days", "5,6")
+    if not val:
+        return []
+    return [int(x) for x in val.split(",") if x.strip().isdigit()]
+
+
 def mark_past_absent():
     """Backfill every un-recorded past day as absent."""
     db    = get_db()
@@ -178,10 +185,14 @@ def mark_past_absent():
         r["date"] for r in db.execute("SELECT date FROM attendance").fetchall()
     }
     rows = []
+    weekends = get_weekend_days()
     while cursor <= yesterday:
         key = cursor.isoformat()
         if key not in existing:
-            rows.append((key, "absent"))
+            if cursor.weekday() in weekends:
+                rows.append((key, "weekend"))
+            else:
+                rows.append((key, "absent"))
         cursor += timedelta(days=1)
 
     if rows:
@@ -314,6 +325,7 @@ nav{display:flex;align-items:center;justify-content:space-between;padding:18px 3
 .badge-absent{background:rgba(255,95,109,.15);color:var(--red);border:1px solid rgba(255,95,109,.3)}
 .badge-holiday{background:rgba(245,166,35,.15);color:var(--amber);border:1px solid rgba(245,166,35,.3)}
 .badge-partial{background:rgba(108,99,255,.15);color:var(--accent);border:1px solid rgba(108,99,255,.3)}
+.badge-weekend{background:rgba(107,114,128,.15);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
 /* misc */
 .text-muted{color:var(--muted);font-size:.9rem}
 .mt-1{margin-top:8px}.mt-2{margin-top:16px}.mt-3{margin-top:24px}.mt-4{margin-top:32px}
@@ -374,6 +386,7 @@ nav{display:flex;align-items:center;justify-content:space-between;padding:18px 3
 .status-tab input:checked + label.l-present{background:rgba(34,211,165,.15);color:var(--green);border-color:rgba(34,211,165,.4)}
 .status-tab input:checked + label.l-absent{background:rgba(255,95,109,.15);color:var(--red);border-color:rgba(255,95,109,.4)}
 .status-tab input:checked + label.l-holiday{background:rgba(245,166,35,.15);color:var(--amber);border-color:rgba(245,166,35,.4)}
+.status-tab input:checked + label.l-weekend{background:rgba(107,114,128,.15);color:#9ca3af;border-color:rgba(107,114,128,.4)}
 .status-tab label:hover{color:var(--text);background:var(--border)}
 .delete-zone{margin-top:16px;padding-top:16px;border-top:1px solid var(--border)}
 """
@@ -426,6 +439,10 @@ EDIT_MODAL = """
         <div class="status-tab">
           <input type="radio" name="status" id="st_holiday" value="holiday">
           <label for="st_holiday" class="l-holiday">&#127958; Holiday</label>
+        </div>
+        <div class="status-tab">
+          <input type="radio" name="status" id="st_weekend" value="weekend">
+          <label for="st_weekend" class="l-weekend">&#128716; Weekend</label>
         </div>
       </div>
 
@@ -540,7 +557,7 @@ document.querySelectorAll('input[name="status"]').forEach(function(r){
 function updateTimePickers(st) {
   var show = (st === 'present' || st === 'partial');
   document.getElementById('timePickers').style.display = show ? '' : 'none';
-  document.getElementById('noteField').style.display   = (st === 'holiday') ? '' : 'none';
+  document.getElementById('noteField').style.display   = (st === 'holiday' || st === 'weekend') ? '' : 'none';
 }
 
 // ── Clock face animation ──────────────────────────────────────────────────────
@@ -771,6 +788,15 @@ HOME_TEMPLATE = """\
             &#8617; Undo &ndash; Treat as Work Day
           </button>
         </form>
+      {% elif status == 'weekend' %}
+        <div style="text-align:center;padding:12px 0;color:#9ca3af;font-weight:600">
+          &#128716; Today is a Weekend
+        </div>
+        <form action="/unmark_holiday" method="post" style="margin-top:12px">
+          <button class="btn btn-ghost big-btn" type="submit">
+            &#8617; Undo &ndash; Treat as Work Day
+          </button>
+        </form>
       {% endif %}
     </div>
   </div>
@@ -833,6 +859,7 @@ CALENDAR_TEMPLATE = """\
   .dstrip{position:absolute;top:0;left:0;right:0;height:3px;border-radius:10px 10px 0 0}
   .s-present{background:var(--green)}.s-absent{background:var(--red)}
   .s-holiday{background:var(--amber)}.s-partial{background:var(--accent)}
+  .s-weekend{background:#9ca3af}
   .dt{font-size:.7rem;color:var(--muted);line-height:1.5;margin-top:2px}
   .dt .tin{color:var(--green);font-weight:600}
   .dt .tout{color:var(--red);font-weight:600}
@@ -878,6 +905,7 @@ CALENDAR_TEMPLATE = """\
     <div class="leg-i"><div class="leg-d" style="background:var(--red)"></div> Absent</div>
     <div class="leg-i"><div class="leg-d" style="background:var(--amber)"></div> Holiday</div>
     <div class="leg-i"><div class="leg-d" style="background:var(--accent)"></div> Partial</div>
+    <div class="leg-i"><div class="leg-d" style="background:#9ca3af"></div> Weekend</div>
     <div class="leg-i" style="margin-left:auto;font-size:.75rem;color:var(--border)">
       &#9998; click any day to edit
     </div>
@@ -931,6 +959,10 @@ CALENDAR_TEMPLATE = """\
           <div class="dstrip s-holiday"></div>
           <div class="dn">{{ day.d }}</div>
           <div class="dt"><div class="thol">&#127958; Holiday</div></div>
+        {% elif rec.get('status') == 'weekend' %}
+          <div class="dstrip s-weekend"></div>
+          <div class="dn">{{ day.d }}</div>
+          <div class="dt"><div class="thol" style="color:#9ca3af">&#128716; Weekend</div></div>
         {% elif rec.get('status') == 'absent' %}
           <div class="dstrip s-absent"></div>
           <div class="dn">{{ day.d }}</div>
@@ -963,9 +995,9 @@ CALENDAR_TEMPLATE = """\
           <td>{{ row.date }}</td>
           <td style="color:var(--muted)">{{ row.weekday }}</td>
           <td><span class="badge badge-{{ row.status_class }}">{{ row.status_label }}</span></td>
-          <td>{{ row.time_in or '&mdash;' }}</td>
-          <td>{{ row.time_out or '&mdash;' }}</td>
-          <td>{{ row.duration or '&mdash;' }}</td>
+          <td>{{ row.time_in or '—' }}</td>
+          <td>{{ row.time_out or '—' }}</td>
+          <td>{{ row.duration or '—' }}</td>
           <td>
             {% if not row.future %}
             <button class="btn btn-ghost btn-icon"
@@ -1066,6 +1098,30 @@ SETTINGS_TEMPLATE = """\
       </form>
     </div>
 
+    <!-- Weekend card -->
+    <div class="card">
+      <div class="section-title">&#128197; Weekend Days</div>
+      <div class="info-pill">
+        Current: <strong>{{ current_weekend_label }}</strong>
+      </div>
+      <form method="post" action="/settings/save">
+        <input type="hidden" name="key" value="weekend_days">
+        <div class="field">
+          <label>Select Weekend Days</label>
+          <select name="value">
+            <option value="5,6" {% if current_weekends == '5,6' %}selected{% endif %}>Saturday &amp; Sunday</option>
+            <option value="4,5" {% if current_weekends == '4,5' %}selected{% endif %}>Friday &amp; Saturday</option>
+            <option value="4"   {% if current_weekends == '4' %}selected{% endif %}>Friday Only</option>
+            <option value="6"   {% if current_weekends == '6' %}selected{% endif %}>Sunday Only</option>
+            <option value=""    {% if current_weekends == '' %}selected{% endif %}>No Weekends</option>
+          </select>
+        </div>
+        <button type="submit" class="btn btn-accent" style="width:100%">
+          &#128190; Save Weekend
+        </button>
+      </form>
+    </div>
+
     <!-- DB Info card -->
     <div class="card">
       <div class="section-title">&#128196; Database Info</div>
@@ -1109,6 +1165,8 @@ def index():
         status = "none"
     elif record["status"] == "holiday":
         status = "holiday"
+    elif record["status"] == "weekend":
+        status = "weekend"
     elif record["time_in"] and record["time_out"]:
         status = "done"
     elif record["time_in"]:
@@ -1121,6 +1179,7 @@ def index():
         "in":      ("partial",   "Clocked In"),
         "done":    ("present",   "Present"),
         "holiday": ("holiday",   "Holiday"),
+        "weekend": ("weekend",   "Weekend"),
     }
     status_class, status_label = status_map[status]
     stats    = compute_stats()
@@ -1192,10 +1251,10 @@ def mark():
 def unmark_holiday():
     today = today_str()
     r = get_record(today)
-    if r and r["status"] == "holiday":
+    if r and r["status"] in ("holiday", "weekend"):
         delete_record(today)
     return redirect(url_for("index",
-        msg="Holiday removed — day is now a work day.", type="info"))
+        msg="Status removed — day is now a work day.", type="info"))
 
 
 @app.route("/entry/edit", methods=["POST"])
@@ -1227,6 +1286,8 @@ def entry_edit():
 
     if status == "holiday":
         upsert_record(day, "holiday", note=note or "Holiday")
+    elif status == "weekend":
+        upsert_record(day, "weekend", note=note or "Weekend")
     elif status == "absent":
         upsert_record(day, "absent")
     else:
@@ -1304,6 +1365,9 @@ def calendar_view():
         if st == "holiday":
             sc, sl = "holiday", "Holiday"
             ti = to_ = dur = None
+        elif st == "weekend":
+            sc, sl = "weekend", "Weekend"
+            ti = to_ = dur = None
         elif st == "absent":
             sc, sl = "absent", "Absent"
             ti = to_ = dur = None
@@ -1363,6 +1427,16 @@ def settings():
     msg_type = request.args.get("type", "info")
     db_count = get_db().execute("SELECT COUNT(*) AS c FROM attendance").fetchone()["c"]
 
+    val = get_setting("weekend_days", "5,6")
+    labels = {
+        "5,6": "Saturday & Sunday",
+        "4,5": "Friday & Saturday",
+        "4": "Friday Only",
+        "6": "Sunday Only",
+        "": "No Weekends"
+    }
+    lbl = labels.get(val, val)
+
     return render_template_string(
         SETTINGS_TEMPLATE,
         base_style=Markup(BASE_STYLE),
@@ -1370,6 +1444,8 @@ def settings():
         current_tz=get_setting("timezone", "UTC"),
         timezones=COMMON_TIMEZONES,
         db_count=db_count,
+        current_weekends=val,
+        current_weekend_label=lbl,
         msg=msg,
         msg_type=msg_type,
     )
@@ -1392,6 +1468,10 @@ def settings_save():
         set_setting("timezone", tz_to_save)
         return redirect(url_for("settings",
             msg=f"Timezone updated to {tz_to_save}", type="success"))
+    elif key == "weekend_days":
+        set_setting("weekend_days", value)
+        return redirect(url_for("settings",
+            msg="Weekend days updated.", type="success"))
 
     return redirect(url_for("settings", msg="Unknown setting.", type="warning"))
 
