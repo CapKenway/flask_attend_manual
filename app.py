@@ -14,22 +14,35 @@ Data stored in SQLite3:  attendance.db  (next to this file)
 """
 
 import os
+import json
 import sqlite3
+import secrets
 import calendar as cal_mod
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from markupsafe import Markup
 from flask import (
-    Flask, g, redirect, render_template_string, request, url_for
+    Flask, g, redirect, render_template_string, request, session, url_for
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(BASE_DIR, "attendance.db")
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+DB_PATH       = os.path.join(BASE_DIR, "attendance.db")
+PASSWORD_FILE = os.path.join(BASE_DIR, "password.txt")
 
 app = Flask(__name__)
+
+# Secret key: stable across restarts (stored in a hidden file next to the app)
+_SK_FILE = os.path.join(BASE_DIR, ".secret_key")
+if os.path.exists(_SK_FILE):
+    with open(_SK_FILE) as _f:
+        app.secret_key = _f.read().strip()
+else:
+    app.secret_key = secrets.token_hex(32)
+    with open(_SK_FILE, "w") as _f:
+        _f.write(app.secret_key)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -165,6 +178,77 @@ def get_weekend_days() -> list[int]:
     if not val:
         return []
     return [int(x) for x in val.split(",") if x.strip().isdigit()]
+
+
+def build_weekend_list() -> list[dict]:
+    """
+    Build a list of weekend-period dicts spanning ~3 months back to
+    ~1 month ahead, each item represents one contiguous weekend block.
+    Each dict: {start, end, label, is_prev, is_next}
+    """
+    today = now_local().date()
+    weekend_days = get_weekend_days()
+
+    # Collect all dates that are weekend days in the ±90-day window
+    start_scan = today - timedelta(days=95)
+    end_scan   = today + timedelta(days=40)
+
+    # Find contiguous weekend blocks
+    blocks = []
+    cursor = start_scan
+    in_block = False
+    block_start = None
+    while cursor <= end_scan:
+        is_wd = cursor.weekday() in weekend_days if weekend_days else False
+        if is_wd and not in_block:
+            block_start = cursor
+            in_block = True
+        elif not is_wd and in_block:
+            blocks.append((block_start, cursor - timedelta(days=1)))
+            in_block = False
+        cursor += timedelta(days=1)
+    if in_block:
+        blocks.append((block_start, cursor - timedelta(days=1)))
+
+    # If no weekend days configured, fall back to weekly Fri-Sat split
+    if not blocks:
+        # no weekends configured — still provide weekly periods
+        w_start = today - timedelta(days=today.weekday() + 9)
+        for _ in range(20):
+            w_end = w_start + timedelta(days=6)
+            blocks.append((w_start, w_end))
+            w_start = w_end + timedelta(days=1)
+
+    result = []
+
+    # Mark previous (most recent past weekend) and next (upcoming weekend)
+    past  = [(bs, be) for bs, be in blocks if be < today]
+    future= [(bs, be) for bs, be in blocks if bs > today]
+    prev_start = past[-1][0].isoformat()  if past   else None
+    next_start = future[0][0].isoformat() if future else None
+
+    for bs, be in blocks:
+        label    = f"{bs.strftime('%d %b')} – {be.strftime('%d %b %Y')}"
+        result.append({
+            "start":   bs.isoformat(),
+            "end":     be.isoformat(),
+            "label":   label,
+            "is_prev": bs.isoformat() == prev_start,
+            "is_next": bs.isoformat() == next_start,
+        })
+
+    return result
+
+
+def build_attend_json() -> str:
+    """Return all attendance rows as a JSON array for the JS calculator."""
+    rows = get_db().execute(
+        "SELECT date, time_in, time_out FROM attendance "
+        "WHERE time_in IS NOT NULL AND time_out IS NOT NULL"
+    ).fetchall()
+    data = [{"date": r["date"], "time_in": r["time_in"], "time_out": r["time_out"]}
+            for r in rows]
+    return Markup(json.dumps(data))
 
 
 def mark_past_absent():
@@ -394,16 +478,43 @@ nav{display:flex;align-items:center;justify-content:space-between;padding:18px 3
 # ──────────────────────────────────────────────────────────────────────────────
 # NAV helper
 # ──────────────────────────────────────────────────────────────────────────────
+def head_tags(title: str) -> str:
+    """Return <head> meta/link tags including favicon if configured."""
+    fav = get_setting("favicon_url", "")
+    fav_tag = f'\n  <link rel="icon" type="image/svg+xml" href="{fav}">' if fav else ""
+    return fav_tag
+
+
+def check_password(entered: str) -> bool:
+    """Compare entered password against password.txt (stripped). Always True if no file."""
+    if not os.path.exists(PASSWORD_FILE):
+        return True   # no password set → open access
+    try:
+        with open(PASSWORD_FILE) as f:
+            stored = f.read().strip()
+        return secrets.compare_digest(entered.strip(), stored)
+    except Exception:
+        return False
+
+
+def settings_authed() -> bool:
+    """Return True if the current session is authenticated for settings."""
+    if not os.path.exists(PASSWORD_FILE):
+        return True   # no password file → no lock
+    return bool(session.get("settings_auth"))
+
+
 def nav_html(active: str) -> str:
     links = [
         ("/",         "Today",    "today"),
         ("/calendar", "Calendar", "calendar"),
         ("/settings", "Settings", "settings"),
     ]
-    items = "".join(
-        f'<a href="{href}" class="{"active" if active == key else ""}">{label}</a>'
-        for href, label, key in links
-    )
+    parts = []
+    for href, label, key in links:
+        cls = "active" if active == key else ""
+        parts.append(f'<a href="{href}" class="{cls}">{label}</a>')
+    items = "".join(parts)
     return f"""
 <nav>
   <span class="brand">&#9201; AttendTrack</span>
@@ -643,6 +754,7 @@ HOME_TEMPLATE = """\
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AttendTrack &ndash; Today</title>
+  {{ favicon_tag }}
   <style>
   {{ base_style }}
   .hero{text-align:center;padding:56px 0 36px}
@@ -808,15 +920,90 @@ HOME_TEMPLATE = """\
     <div class="stat-box"><div class="stat-val">{{ stats.total_hours }}</div><div class="stat-lbl">Total Hours</div></div>
   </div>
 
+  <!-- Weekend Range Calculator -->
+  <div class="card mt-4" id="weekendRangeCard">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+      <div>
+        <h2 style="font-size:1.1rem;font-weight:700">&#128197; Weekend-to-Weekend Hours</h2>
+        <p class="text-muted mt-1" style="font-size:.85rem">Select any two weekends to see total hours worked between them.</p>
+      </div>
+      <div id="wkResult" style="font-size:1.5rem;font-weight:800;
+           background:linear-gradient(135deg,var(--accent),var(--green));
+           -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+           background-clip:text;min-width:90px;text-align:right"></div>
+    </div>
+    <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+      <div class="field" style="flex:1;min-width:180px;margin-bottom:0">
+        <label>From Weekend</label>
+        <select id="wkFrom" onchange="calcWeekendRange()">
+          {% for wk in weekend_list %}
+          <option value="{{ wk.start }}_{{ wk.end }}" {% if wk.is_prev %}selected{% endif %}>{{ wk.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field" style="flex:1;min-width:180px;margin-bottom:0">
+        <label>To Weekend</label>
+        <select id="wkTo" onchange="calcWeekendRange()">
+          {% for wk in weekend_list %}
+          <option value="{{ wk.start }}_{{ wk.end }}" {% if wk.is_next %}selected{% endif %}>{{ wk.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div id="wkDetail" style="margin-top:16px;font-size:.83rem;color:var(--muted);line-height:1.8"></div>
+  </div>
+
 </div>
 
 {{ edit_modal }}
 
 <script>
+// ── Weekend range calculator ──────────────────────────────────────────────────
+var ATTEND_DATA = {{ attend_json }};
+
+function calcWeekendRange() {
+  var fromVal = document.getElementById('wkFrom').value;
+  var toVal   = document.getElementById('wkTo').value;
+  if (!fromVal || !toVal) return;
+
+  var fromParts = fromVal.split('_'), toParts = toVal.split('_');
+  var rangeStart = fromParts[0] < toParts[0] ? fromParts[0] : toParts[0];
+  var rangeEnd   = fromParts[1] > toParts[1] ? fromParts[1] : toParts[1];
+
+  var totalMins = 0, days = 0;
+  var detail = [];
+  ATTEND_DATA.forEach(function(r) {
+    if (r.date >= rangeStart && r.date <= rangeEnd && r.time_in && r.time_out) {
+      var a = new Date(r.time_in), b = new Date(r.time_out);
+      var mins = Math.round((b - a) / 60000);
+      totalMins += mins;
+      days++;
+      var dh = Math.floor(mins/60), dm = mins % 60;
+      detail.push(r.date + ' &rarr; ' + dh + 'h ' + String(dm).padStart(2,'0') + 'm');
+    }
+  });
+
+  var th = Math.floor(totalMins/60), tm = totalMins % 60;
+  var res = document.getElementById('wkResult');
+  var det = document.getElementById('wkDetail');
+  if (days === 0) {
+    res.textContent = '0h 00m';
+    det.innerHTML = '<em>No attendance records found in this range.</em>';
+  } else {
+    res.textContent = th + 'h ' + String(tm).padStart(2,'0') + 'm';
+    det.innerHTML = '<strong style="color:var(--text)">' + days + ' day(s) worked:</strong><br>' + detail.join('<br>');
+  }
+}
+calcWeekendRange();
+</script>
+
+<script>
 function tick(){
   var e=document.getElementById('ltime');
   var n=new Date();
-  e.textContent=String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0')+':'+String(n.getSeconds()).padStart(2,'0');
+  var h=n.getHours(),ampm=h>=12?'PM':'AM';
+  h=h%12||12;
+  e.textContent=String(h).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0')+':'+String(n.getSeconds()).padStart(2,'0')+' '+ampm;
 }
 tick(); setInterval(tick,1000);
 </script>
@@ -834,6 +1021,7 @@ CALENDAR_TEMPLATE = """\
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AttendTrack &ndash; Calendar</title>
+  {{ favicon_tag }}
   <style>
   {{ base_style }}
   .page-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px}
@@ -1021,13 +1209,141 @@ CALENDAR_TEMPLATE = """\
     {% endif %}
   </div>
 
+  <!-- Weekend Range Calculator -->
+  <div class="card mt-4" id="weekendRangeCard">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
+      <div>
+        <h2 style="font-size:1.1rem;font-weight:700">&#128197; Weekend-to-Weekend Hours</h2>
+        <p class="text-muted mt-1" style="font-size:.85rem">Select any two weekends to see total hours worked between them.</p>
+      </div>
+      <div id="wkResult" style="font-size:1.5rem;font-weight:800;
+           background:linear-gradient(135deg,var(--accent),var(--green));
+           -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+           background-clip:text;min-width:90px;text-align:right"></div>
+    </div>
+    <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+      <div class="field" style="flex:1;min-width:180px;margin-bottom:0">
+        <label>From Weekend</label>
+        <select id="wkFrom" onchange="calcWeekendRange()">
+          {% for wk in weekend_list %}
+          <option value="{{ wk.start }}_{{ wk.end }}" {% if wk.is_prev %}selected{% endif %}>{{ wk.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field" style="flex:1;min-width:180px;margin-bottom:0">
+        <label>To Weekend</label>
+        <select id="wkTo" onchange="calcWeekendRange()">
+          {% for wk in weekend_list %}
+          <option value="{{ wk.start }}_{{ wk.end }}" {% if wk.is_next %}selected{% endif %}>{{ wk.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div id="wkDetail" style="margin-top:16px;font-size:.83rem;color:var(--muted);line-height:1.8"></div>
+  </div>
+
 </div>
 
 {{ edit_modal }}
 
+<script>
+// ── Weekend range calculator ──────────────────────────────────────────────────
+var ATTEND_DATA = {{ attend_json }};
+
+function calcWeekendRange() {
+  var fromVal = document.getElementById('wkFrom').value;
+  var toVal   = document.getElementById('wkTo').value;
+  if (!fromVal || !toVal) return;
+
+  var fromParts = fromVal.split('_'), toParts = toVal.split('_');
+  var rangeStart = fromParts[0] < toParts[0] ? fromParts[0] : toParts[0];
+  var rangeEnd   = fromParts[1] > toParts[1] ? fromParts[1] : toParts[1];
+
+  var totalMins = 0, days = 0;
+  var detail = [];
+  ATTEND_DATA.forEach(function(r) {
+    if (r.date >= rangeStart && r.date <= rangeEnd && r.time_in && r.time_out) {
+      var a = new Date(r.time_in), b = new Date(r.time_out);
+      var mins = Math.round((b - a) / 60000);
+      totalMins += mins;
+      days++;
+      var dh = Math.floor(mins/60), dm = mins % 60;
+      detail.push(r.date + ' &rarr; ' + dh + 'h ' + String(dm).padStart(2,'0') + 'm');
+    }
+  });
+
+  var th = Math.floor(totalMins/60), tm = totalMins % 60;
+  var res = document.getElementById('wkResult');
+  var det = document.getElementById('wkDetail');
+  if (days === 0) {
+    res.textContent = '0h 00m';
+    det.innerHTML = '<em>No attendance records found in this range.</em>';
+  } else {
+    res.textContent = th + 'h ' + String(tm).padStart(2,'0') + 'm';
+    det.innerHTML = '<strong style="color:var(--text)">' + days + ' day(s) worked:</strong><br>' + detail.join('<br>');
+  }
+}
+calcWeekendRange();
+</script>
+
 </body>
 </html>
 """
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Settings login template
+# ──────────────────────────────────────────────────────────────────────────────
+SETTINGS_LOGIN_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AttendTrack &ndash; Settings Login</title>
+  {{ favicon_tag }}
+  <style>
+  {{ base_style }}
+  .lock-wrap{min-height:calc(100vh - 70px);display:flex;align-items:center;justify-content:center;padding:24px}
+  .lock-card{background:var(--surface);border:1px solid var(--border);border-radius:20px;
+             padding:48px 40px;width:100%;max-width:400px;text-align:center}
+  .lock-icon{font-size:3.5rem;margin-bottom:16px;display:block;
+             animation:float 3s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+  .lock-title{font-size:1.6rem;font-weight:800;
+              background:linear-gradient(135deg,#fff,var(--accent));
+              -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+              margin-bottom:8px}
+  .lock-sub{color:var(--muted);font-size:.88rem;margin-bottom:32px}
+  .pw-input{background:var(--surface2);border:2px solid var(--border);border-radius:12px;
+            color:var(--text);font-family:inherit;font-size:1rem;padding:14px 16px;
+            outline:none;transition:border-color .2s,box-shadow .2s;width:100%;text-align:center;
+            letter-spacing:3px;margin-bottom:16px}
+  .pw-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--ag)}
+  .pw-input::placeholder{letter-spacing:0;color:var(--muted)}
+  .err{color:var(--red);font-size:.85rem;margin-bottom:16px;animation:slideIn .3s ease}
+  </style>
+</head>
+<body>
+{{ nav }}
+<div class="lock-wrap">
+  <div class="lock-card">
+    <span class="lock-icon">&#128274;</span>
+    <div class="lock-title">Settings Locked</div>
+    <p class="lock-sub">Enter the password from <code style="background:var(--surface2);padding:2px 8px;border-radius:6px">password.txt</code> to continue.</p>
+    {% if error %}<div class="err">&#10007; Incorrect password — try again.</div>{% endif %}
+    <form method="post" action="/settings/login">
+      <input type="hidden" name="next" value="{{ next_url }}">
+      <input type="password" name="password" class="pw-input" placeholder="Enter password" autofocus autocomplete="current-password">
+      <button type="submit" class="btn btn-accent" style="width:100%;padding:16px;font-size:1rem">
+        &#128275; Unlock Settings
+      </button>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Settings template
@@ -1039,6 +1355,7 @@ SETTINGS_TEMPLATE = """\
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AttendTrack &ndash; Settings</title>
+  {{ favicon_tag }}
   <style>
   {{ base_style }}
   .page-title{font-size:1.6rem;font-weight:800;margin-bottom:8px;
@@ -1052,6 +1369,8 @@ SETTINGS_TEMPLATE = """\
              border:1px solid var(--border);border-radius:10px;padding:10px 16px;
              font-size:.9rem;color:var(--muted);margin-bottom:12px}
   .info-pill strong{color:var(--text)}
+  .fav-preview{width:32px;height:32px;border-radius:6px;object-fit:contain;
+               border:1px solid var(--border);background:var(--surface2);vertical-align:middle}
   </style>
 </head>
 <body>
@@ -1062,8 +1381,19 @@ SETTINGS_TEMPLATE = """\
   <div class="flash flash-{{ msg_type }}">{{ msg }}</div>
   {% endif %}
 
-  <h1 class="page-title">Settings</h1>
-  <p class="text-muted">Configure how AttendTrack behaves.</p>
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <div>
+      <h1 class="page-title">Settings</h1>
+      <p class="text-muted">Configure how AttendTrack behaves.</p>
+    </div>
+    {% if has_password %}
+    <form method="post" action="/settings/logout" style="margin-top:4px">
+      <button type="submit" class="btn btn-ghost" style="padding:10px 18px;font-size:.88rem">
+        &#128274; Lock Settings
+      </button>
+    </form>
+    {% endif %}
+  </div>
 
   <div class="settings-grid">
 
@@ -1119,6 +1449,42 @@ SETTINGS_TEMPLATE = """\
         <button type="submit" class="btn btn-accent" style="width:100%">
           &#128190; Save Weekend
         </button>
+      </form>
+    </div>
+
+    <!-- Favicon card -->
+    <div class="card">
+      <div class="section-title">&#127759; Site Favicon</div>
+      {% if current_favicon %}
+      <div class="info-pill">
+        <img src="{{ current_favicon }}" class="fav-preview" alt="favicon preview" onerror="this.style.display='none'">
+        <span style="font-size:.8rem;word-break:break-all">{{ current_favicon[:48] }}{% if current_favicon|length > 48 %}&hellip;{% endif %}</span>
+      </div><br>
+      {% else %}
+      <div class="info-pill">No custom favicon set</div><br>
+      {% endif %}
+      <form method="post" action="/settings/save">
+        <input type="hidden" name="key" value="favicon_url">
+        <div class="field">
+          <label>SVG / Image URL</label>
+          <input type="url" name="value" id="faviconUrl"
+                 value="{{ current_favicon }}"
+                 placeholder="https://example.com/icon.svg">
+          <small style="color:var(--muted);font-size:.78rem;margin-top:4px">
+            Paste any online SVG or PNG URL. It will appear as the browser tab icon.
+          </small>
+        </div>
+        <div style="display:flex;gap:10px">
+          <button type="submit" class="btn btn-accent" style="flex:1">
+            &#128190; Save Favicon
+          </button>
+          {% if current_favicon %}
+          <button type="submit" class="btn btn-ghost" style="flex:0 0 auto"
+                  onclick="document.getElementById('faviconUrl').value=''">
+            &#10005; Clear
+          </button>
+          {% endif %}
+        </div>
       </form>
     </div>
 
@@ -1190,11 +1556,12 @@ def index():
         HOME_TEMPLATE,
         base_style=Markup(BASE_STYLE),
         nav=Markup(nav_html("today")),
+        favicon_tag=Markup(head_tags("Today")),
         edit_modal=Markup(EDIT_MODAL),
         today_fmt=now.strftime("%B %d, %Y"),
         today_full=now.strftime("%A, %B %d %Y"),
         weekday=now.strftime("%A"),
-        cur_time=now.strftime("%H:%M:%S"),
+        cur_time=now.strftime("%I:%M:%S %p"),
         timezone=get_setting("timezone", "UTC"),
         today=today,
         record=record,
@@ -1202,6 +1569,8 @@ def index():
         status_class=status_class,
         status_label=status_label,
         stats=stats,
+        weekend_list=build_weekend_list(),
+        attend_json=build_attend_json(),
         msg=msg,
         msg_type=msg_type,
     )
@@ -1406,6 +1775,7 @@ def calendar_view():
         CALENDAR_TEMPLATE,
         base_style=Markup(BASE_STYLE),
         nav=Markup(nav_html("calendar")),
+        favicon_tag=Markup(head_tags("Calendar")),
         edit_modal=Markup(EDIT_MODAL),
         recs=recs,
         days=days,
@@ -1416,6 +1786,8 @@ def calendar_view():
         prev_y=prev_y, prev_m=prev_m,
         next_y=next_y, next_m=next_m,
         month_records=month_records,
+        weekend_list=build_weekend_list(),
+        attend_json=build_attend_json(),
         msg=msg,
         msg_type=msg_type,
     )
@@ -1423,6 +1795,16 @@ def calendar_view():
 
 @app.route("/settings", methods=["GET"])
 def settings():
+    if not settings_authed():
+        return render_template_string(
+            SETTINGS_LOGIN_TEMPLATE,
+            base_style=Markup(BASE_STYLE),
+            nav=Markup(nav_html("settings")),
+            favicon_tag=Markup(head_tags("Settings")),
+            error=False,
+            next_url=request.args.get("next", "/settings"),
+        )
+
     msg      = request.args.get("msg", "")
     msg_type = request.args.get("type", "info")
     db_count = get_db().execute("SELECT COUNT(*) AS c FROM attendance").fetchone()["c"]
@@ -1441,25 +1823,53 @@ def settings():
         SETTINGS_TEMPLATE,
         base_style=Markup(BASE_STYLE),
         nav=Markup(nav_html("settings")),
+        favicon_tag=Markup(head_tags("Settings")),
         current_tz=get_setting("timezone", "UTC"),
         timezones=COMMON_TIMEZONES,
         db_count=db_count,
         current_weekends=val,
         current_weekend_label=lbl,
+        current_favicon=get_setting("favicon_url", ""),
+        has_password=os.path.exists(PASSWORD_FILE),
         msg=msg,
         msg_type=msg_type,
     )
 
 
+@app.route("/settings/login", methods=["POST"])
+def settings_login():
+    entered  = request.form.get("password", "")
+    next_url = request.form.get("next", "/settings")
+    if check_password(entered):
+        session["settings_auth"] = True
+        return redirect(next_url)
+    return render_template_string(
+        SETTINGS_LOGIN_TEMPLATE,
+        base_style=Markup(BASE_STYLE),
+        nav=Markup(nav_html("settings")),
+        favicon_tag=Markup(head_tags("Settings")),
+        error=True,
+        next_url=next_url,
+    )
+
+
+@app.route("/settings/logout", methods=["POST"])
+def settings_logout():
+    session.pop("settings_auth", None)
+    return redirect(url_for("index"))
+
+
 @app.route("/settings/save", methods=["POST"])
 def settings_save():
+    if not settings_authed():
+        return redirect(url_for("settings"))
+
     key       = request.form.get("key", "").strip()
     value     = request.form.get("value", "").strip()
     custom_tz = request.form.get("custom_tz", "").strip()
 
     if key == "timezone":
         tz_to_save = custom_tz if custom_tz else value
-        # Validate
         try:
             ZoneInfo(tz_to_save)
         except ZoneInfoNotFoundError:
@@ -1472,12 +1882,18 @@ def settings_save():
         set_setting("weekend_days", value)
         return redirect(url_for("settings",
             msg="Weekend days updated.", type="success"))
+    elif key == "favicon_url":
+        set_setting("favicon_url", value)
+        msg = "Favicon cleared." if not value else "Favicon updated — reload the page to see it in the tab."
+        return redirect(url_for("settings", msg=msg, type="success"))
 
     return redirect(url_for("settings", msg="Unknown setting.", type="warning"))
 
 
 @app.route("/settings/reset", methods=["POST"])
 def settings_reset():
+    if not settings_authed():
+        return redirect(url_for("settings"))
     get_db().execute("DELETE FROM attendance")
     get_db().commit()
     return redirect(url_for("settings",
